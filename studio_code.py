@@ -111,5 +111,11 @@ if st.button("🚀 开始生成", type="primary", use_container_width=True):
             
             st.success(f"成功生成 {len(inserts)} 条数据！")
             st.code("\n".join(inserts), language="sql")
+            st.download_button(
+                label="📥 下载生成的 SQL 文件",
+                data="\n".join(inserts),
+                file_name=f"insert_statements_{datetime.datetime.now().strftime('%Y%m%d%H%M')}.sql",
+                mime="text/sql"
+            )
         except Exception as e:
             st.error(f"解析失败，请检查输入格式。错误详情: {e}")

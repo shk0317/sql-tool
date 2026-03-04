@@ -108,14 +108,13 @@ if st.button("🚀 开始生成", type="primary", use_container_width=True):
                        f"(dict_id, tenant_id, tenant_bu_id, column_code, column_name_cn, column_name_en, model_code, model_type, parent_column_code, column_type, create_user_id, create_user, create_time) "
                        f"VALUES({dict_id}, 1, 1, '{column_code}', '{cn_name}', '{column_code}', '{model_code}', '{model_type}', {p_val}, 'STRING', 1, '1', '{now_str}');")
                 inserts.append(sql)
-            
-            st.success(f"成功生成 {len(inserts)} 条数据！")
-            st.code("\n".join(inserts), language="sql")
             st.download_button(
                 label="📥 下载生成的 SQL 文件",
                 data="\n".join(inserts),
                 file_name=f"insert_statements_{datetime.datetime.now().strftime('%Y%m%d%H%M')}.sql",
                 mime="text/sql"
             )
+            st.success(f"成功生成 {len(inserts)} 条数据！")
+            st.code("\n".join(inserts), language="sql")
         except Exception as e:
             st.error(f"解析失败，请检查输入格式。错误详情: {e}")

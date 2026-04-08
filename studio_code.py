@@ -3,9 +3,9 @@ import re
 import datetime
 import time
 import threading
-from sqlglot import parse_one, exp, errors
+from sqlglot import parse_one, exp
 
-# --- ID生成器逻辑 (保持不变) ---
+# --- ID生成器逻辑 ---
 class SnowflakeIdGenerator:
     def __init__(self, worker_id=1, datacenter_id=1):
         self.worker_id = worker_id
@@ -30,153 +30,269 @@ class SnowflakeIdGenerator:
 if 'id_gen' not in st.session_state:
     st.session_state.id_gen = SnowflakeIdGenerator()
 
-# --- 辅助函数 ---
 def to_camel_case(snake_str):
     if not snake_str: return ""
     components = snake_str.split('_')
     return components[0] + ''.join(x.title() for x in components[1:])
 
+def escape_sql_value(value):
+    return value.replace("'", "''") if value else value
+
 def parse_ddl_robust(ddl_text):
     table_dict = {}
-    # 匹配 CREATE TABLE 块
     table_blocks = re.findall(r'CREATE\s+TABLE\s+`?(\w+)`?\s*\((.*?)\)\s*(?:ENGINE|COMMENT|COLLATE|;)', ddl_text, re.S | re.I)
     for table_name, content in table_blocks:
         cols = {}
         lines = content.split('\n')
         for line in lines:
             line = line.strip()
-            # 匹配列名和注释
             col_match = re.search(r'^`?(\w+)`?\s+.*COMMENT\s+\'([^\']+)\'', line, re.I)
             if col_match:
                 cols[col_match.group(1)] = col_match.group(2)
         table_dict[table_name] = cols
     return table_dict
 
-# --- 校验函数 ---
-def validate_sql_syntax(sql):
-    if not sql.strip(): return None, ""
-    try:
-        parsed = parse_one(sql, read="mysql")
-        return True, "✅ SQL 语法正确"
-    except errors.ParseError as e:
-        # 只取前100个字符避免UI撑爆
-        return False, f"❌ SQL 语法错误: {str(e)[:100]}..."
-    except Exception:
-        return False, "❌ SQL 解析异常"
+def build_insert_sql(column_code, column_name_cn, model_code, model_type, parent_code, now_str, column_type="STRING"):
+    dict_id = st.session_state.id_gen.next_id()
+    p_val = f"'{escape_sql_value(parent_code)}'" if parent_code else "NULL"
+    safe_column_code = escape_sql_value(column_code)
+    safe_column_name_cn = escape_sql_value(column_name_cn)
+    return (
+        f"INSERT INTO base_report_model_dict "
+        f"(dict_id, tenant_id, tenant_bu_id, column_code, column_name_cn, column_name_en, model_code, model_type, parent_column_code, column_type, create_user_id, create_user, create_time) "
+        f"VALUES({dict_id}, 1, 1, '{safe_column_code}', '{safe_column_name_cn}', '{safe_column_code}', '{escape_sql_value(model_code)}', '{escape_sql_value(model_type)}', {p_val}, '{escape_sql_value(column_type)}', 1, '1', '{now_str}');"
+    )
 
-def validate_ddl_content(ddl):
-    if not ddl.strip(): return None, ""
-    data = parse_ddl_robust(ddl)
-    if not data:
-        return False, "❌ 未检测到有效的 CREATE TABLE 语句或 COMMENT 备注"
-    tables_found = ", ".join(data.keys())
-    return True, f"✅ 已识别表: {tables_found}"
+def extract_schema_description(annotation_lines):
+    annotation_text = " ".join(annotation_lines)
+    schema_match = re.search(r'@Schema\s*\((.*?)\)', annotation_text)
+    if not schema_match:
+        return ""
+    description_match = re.search(r'description\s*=\s*"([^"]*)"', schema_match.group(1))
+    return description_match.group(1).strip() if description_match else ""
+
+def analyze_java_type(field_type):
+    normalized = re.sub(r'@\w+(?:\([^)]*\))?\s*', '', field_type).strip()
+    normalized = re.sub(r'\b(final|static|transient|volatile)\b', '', normalized).strip()
+    normalized = normalized.replace("?", "")
+    is_list = bool(re.search(r'\b(List|Set|Collection|ArrayList|LinkedList|HashSet)\s*<', normalized)) or normalized.endswith("[]")
+    generic_match = re.search(r'<\s*([A-Za-z_]\w*)\s*>', normalized)
+    base_type = generic_match.group(1) if generic_match else re.sub(r'[\[\]\s]', '', normalized).split('.')[-1]
+    return {
+        "raw_type": normalized,
+        "base_type": base_type,
+        "is_list": is_list,
+    }
+
+def parse_java_entities(java_text):
+    entities = {}
+    class_order = []
+    annotation_buffer = []
+    pending_description = ""
+    current_class = None
+    brace_depth = 0
+
+    for raw_line in java_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        class_match = re.search(r'\bclass\s+(\w+)\b', line)
+        if class_match:
+            current_class = class_match.group(1)
+            if current_class not in entities:
+                entities[current_class] = []
+                class_order.append(current_class)
+            brace_depth += line.count("{") - line.count("}")
+            annotation_buffer = []
+            pending_description = ""
+            continue
+
+        if current_class is None:
+            continue
+
+        if line.startswith("@"):
+            annotation_buffer.append(line)
+            description = extract_schema_description(annotation_buffer)
+            if description:
+                pending_description = description
+            brace_depth += line.count("{") - line.count("}")
+            continue
+
+        field_match = re.match(r'^(?:private|protected|public)\s+(.+?)\s+(\w+)\s*(?:=[^;]*)?;', line)
+        if field_match:
+            field_type_info = analyze_java_type(field_match.group(1))
+            field_name = field_match.group(2)
+            if field_name != "serialVersionUID":
+                entities[current_class].append(
+                    {
+                        "field_name": field_name,
+                        "field_type": field_type_info["base_type"],
+                        "is_list": field_type_info["is_list"],
+                        "column_name_cn": pending_description or field_name,
+                    }
+                )
+            annotation_buffer = []
+            pending_description = ""
+
+        brace_depth += line.count("{") - line.count("}")
+        if brace_depth <= 0:
+            current_class = None
+            brace_depth = 0
+            annotation_buffer = []
+            pending_description = ""
+
+    return entities, class_order
+
+def build_nested_column_name(prefix, field_name_cn):
+    if not prefix:
+        return field_name_cn
+    return f"{prefix}-{field_name_cn}"
+
+def expand_java_entity_fields(entities, root_class_name):
+    expanded_fields = []
+    primitive_types = {
+        "String", "Long", "Integer", "Short", "Byte", "Boolean", "Double", "Float",
+        "BigDecimal", "BigInteger", "Date", "LocalDate", "LocalDateTime", "LocalTime",
+        "Timestamp", "Object", "Map", "JSONObject"
+    }
+
+    def walk(class_name, code_prefix="", name_prefix="", seen_classes=None, inherited_parent_code=""):
+        if class_name not in entities:
+            return
+
+        seen_classes = seen_classes or set()
+        if class_name in seen_classes:
+            return
+
+        next_seen_classes = seen_classes | {class_name}
+        for field in entities[class_name]:
+            next_code = field["field_name"]
+            next_name = build_nested_column_name(name_prefix, field["column_name_cn"])
+            field_type = field["field_type"]
+            is_nested_entity = field_type in entities and field_type not in primitive_types
+            current_column_type = "LIST" if field.get("is_list") else "OBJECT"
+
+            if is_nested_entity:
+                expanded_fields.append(
+                    {
+                        "column_code": next_code,
+                        "column_name_cn": next_name,
+                        "column_type": current_column_type,
+                        "parent_column_code": inherited_parent_code,
+                    }
+                )
+                walk(field_type, next_code, next_name, next_seen_classes, next_code)
+            else:
+                expanded_fields.append(
+                    {
+                        "column_code": next_code,
+                        "column_name_cn": next_name,
+                        "column_type": "STRING",
+                        "parent_column_code": inherited_parent_code,
+                    }
+                )
+
+    walk(root_class_name)
+    return expanded_fields
 
 # --- 界面部分 ---
 st.set_page_config(page_title="SQL报表字典工具", layout="wide")
 
 st.title("📊 报表字典 Insert 语句生成器")
+st.info("支持通过 SQL + DDL 或 Java 实体类识别字段，生成 report_model_dict 插入语句")
 
-# 侧边栏配置
 with st.sidebar:
     st.header("⚙️ 参数配置")
-    model_code = st.text_input("Model Code", value="REPORT_NAME", help="对应表中的 model_code 字段")
-    model_type = st.selectbox("Model Type", options=["PRINT", "EXPORT", "QUERY"], help="报表类型")
+    model_code = st.text_input("Model Code", value="REPORT_NAME")
+    model_type = st.selectbox("Model Type", options=["PRINT", "EXPORT", "QUERY"])
     parent_code = st.text_input("Parent Column Code (可选)", value="")
-    st.divider()
-    st.markdown("### 使用说明")
-    st.caption("1. 粘贴查询 SQL (支持别名)\n2. 粘贴 DDL (需包含字段 COMMENT)\n3. 点击开始生成")
 
-# 主界面布局
-col1, col2 = st.columns(2)
+tab_sql, tab_java = st.tabs(["SQL + DDL", "Java 实体类"])
 
-with col1:
-    sql_input = st.text_area("1. 粘贴查询 SQL", height=300, placeholder="SELECT a.id FROM table_a a...")
-    # SQL 实时校验反馈
-    sql_ok, sql_msg = validate_sql_syntax(sql_input)
-    if sql_ok is True:
-        st.success(sql_msg)
-    elif sql_ok is False:
-        st.error(sql_msg)
+with tab_sql:
+    col1, col2 = st.columns(2)
+    with col1:
+        sql_input = st.text_area("1. 粘贴查询 SQL", height=250)
+    with col2:
+        ddl_input = st.text_area("2. 粘贴 DDL 语句", height=250)
 
-with col2:
-    ddl_input = st.text_area("2. 粘贴 DDL 语句", height=300, placeholder="CREATE TABLE `xxx` ( `col` varchar(1) COMMENT '备注' )...")
-    # DDL 实时校验反馈
-    ddl_ok, ddl_msg = validate_ddl_content(ddl_input)
-    if ddl_ok is True:
-        st.info(ddl_msg)
-    elif ddl_ok is False:
-        st.warning(ddl_msg)
+    if st.button("🚀 通过 SQL + DDL 生成", type="primary", use_container_width=True):
+        if sql_input and ddl_input:
+            try:
+                ddl_data = parse_ddl_robust(ddl_input)
+                expr = parse_one(sql_input, read="mysql")
+                alias_map = {t.alias_or_name: t.name for t in expr.find_all(exp.Table)}
 
-st.divider()
+                inserts = []
+                now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-# 生成按钮逻辑
-if st.button("✨ 开始生成 INSERT 语句", type="primary", use_container_width=True):
-    # 最终校验
-    if not sql_input or not ddl_input:
-        st.error("请输入 SQL 和 DDL 内容后再执行！")
-    elif sql_ok is False:
-        st.error("SQL 语法校验未通过，请修正后再试。")
-    elif not ddl_ok:
-        st.error("DDL 未能解析到任何表结构，请确认是否包含 COMMENT。")
-    else:
-        try:
-            ddl_data = parse_ddl_robust(ddl_input)
-            expr = parse_one(sql_input, read="mysql")
-            
-            # 建立别名映射
-            alias_map = {t.alias_or_name: t.name for t in expr.find_all(exp.Table)}
-            
-            inserts = []
-            now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 解析 SELECT 字段
-            selections = expr.find(exp.Select).expressions
-            
-            for selection in selections:
-                col_name, table_alias = "", ""
-                
-                if isinstance(selection, exp.Column):
-                    col_name, table_alias = selection.name, selection.table
-                elif isinstance(selection, exp.Alias):
-                    col_name = selection.alias
-                    if isinstance(selection.this, exp.Column):
-                        table_alias = selection.this.table
-                
-                if not col_name: continue
-                
-                # 转换 column_code
-                raw_camel = to_camel_case(col_name)
-                # 别名逻辑：如果带了别名，拼接别名以防多表同名冲突
-                column_code = f"{table_alias}{raw_camel[0].upper()}{raw_camel[1:]}" if table_alias else raw_camel
-                
-                # 查找备注
-                real_table = alias_map.get(table_alias, "")
-                cn_name = "未知字段"
-                if real_table in ddl_data and col_name in ddl_data[real_table]:
-                    cn_name = ddl_data[real_table][col_name]
-                else:
-                    # 全局匹配
-                    for t in ddl_data:
-                        if col_name in ddl_data[t]:
-                            cn_name = ddl_data[t][col_name]
-                            break
-                
-                # 生成 SQL
-                dict_id = st.session_state.id_gen.next_id()
-                p_val = f"'{parent_code}'" if parent_code else "NULL"
-                
-                sql = (f"INSERT INTO base_report_model_dict "
-                       f"(dict_id, tenant_id, tenant_bu_id, column_code, column_name_cn, column_name_en, model_code, model_type, parent_column_code, column_type, create_user_id, create_user, create_time) "
-                       f"VALUES({dict_id}, 1, 1, '{column_code}', '{cn_name}', '{column_code}', '{model_code}', '{model_type}', {p_val}, 'STRING', 1, '1', '{now_str}');")
-                inserts.append(sql)
-            
-            if inserts:
-                st.success(f"🎊 生成成功！共解析出 {len(inserts)} 个字段。")
-                st.download_button("📥 下载 SQL 结果", data="\n".join(inserts), file_name="report_dict.sql")
+                for selection in expr.find(exp.Select).expressions:
+                    col_name, table_alias = "", ""
+                    if isinstance(selection, exp.Column):
+                        col_name, table_alias = selection.name, selection.table
+                    elif isinstance(selection, exp.Alias):
+                        col_name = selection.alias
+                        if isinstance(selection.this, exp.Column):
+                            table_alias = selection.this.table
+
+                    if not col_name:
+                        continue
+
+                    raw_camel = to_camel_case(col_name)
+                    column_code = f"{table_alias}{raw_camel[0].upper()}{raw_camel[1:]}" if table_alias else raw_camel
+
+                    real_table = alias_map.get(table_alias, "")
+                    cn_name = "未知字段"
+                    if real_table in ddl_data and col_name in ddl_data[real_table]:
+                        cn_name = ddl_data[real_table][col_name]
+                    else:
+                        for t in ddl_data:
+                            if col_name in ddl_data[t]:
+                                cn_name = ddl_data[t][col_name]
+                                break
+
+                    inserts.append(build_insert_sql(column_code, cn_name, model_code, model_type, parent_code, now_str))
+
+                st.success(f"成功生成 {len(inserts)} 条数据！")
                 st.code("\n".join(inserts), language="sql")
-            else:
-                st.warning("未能在 SQL 中解析到有效的字段。")
-                
-        except Exception as e:
-            st.error(f"🔥 程序运行时崩溃: {e}")
+            except Exception as e:
+                st.error(f"解析失败，请检查输入格式。错误详情: {e}")
+        else:
+            st.warning("请先同时输入查询 SQL 和 DDL 语句。")
+
+with tab_java:
+    java_input = st.text_area("粘贴 Java 实体类代码", height=520, placeholder='public class OrderVO {\n    @Schema(description = "主单号id")\n    private String mainOrderId;\n\n    @Schema(description = "明细信息")\n    private DetailVO detail;\n}\n\npublic class DetailVO {\n    @Schema(description = "商品编码")\n    private String itemCode;\n}')
+
+    if st.button("🚀 通过 Java 实体类生成", type="primary", use_container_width=True):
+        if java_input:
+            try:
+                entities, class_order = parse_java_entities(java_input)
+                if not class_order:
+                    raise ValueError("未识别到实体类定义")
+
+                fields = expand_java_entity_fields(entities, class_order[0])
+                now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                inserts = [
+                    build_insert_sql(
+                        field["column_code"],
+                        field["column_name_cn"],
+                        model_code,
+                        model_type,
+                        field.get("parent_column_code") or parent_code,
+                        now_str,
+                        field.get("column_type", "STRING")
+                    )
+                    for field in fields
+                ]
+
+                if inserts:
+                    st.caption(f"已识别 {len(class_order)} 个实体类，默认以第一个实体类 `{class_order[0]}` 作为主实体递归展开。")
+                    st.success(f"成功生成 {len(inserts)} 条数据！")
+                    st.code("\n".join(inserts), language="sql")
+                else:
+                    st.warning("未识别到可生成的实体类字段，请检查字段定义、嵌套关系或 @Schema 注解格式。")
+            except Exception as e:
+                st.error(f"解析失败，请检查 Java 实体类格式。错误详情: {e}")
+        else:
+            st.warning("请先输入 Java 实体类代码。")

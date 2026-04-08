@@ -63,6 +63,19 @@ def build_insert_sql(column_code, column_name_cn, model_code, model_type, parent
         f"VALUES({dict_id}, 1, 1, '{safe_column_code}', '{safe_column_name_cn}', '{safe_column_code}', '{escape_sql_value(model_code)}', '{escape_sql_value(model_type)}', {p_val}, '{escape_sql_value(column_type)}', 1, '1', '{now_str}');"
     )
 
+def render_sql_result(inserts, download_key, file_prefix):
+    sql_content = "\n".join(inserts)
+    st.success(f"成功生成 {len(inserts)} 条数据！")
+    st.code(sql_content, language="sql")
+    st.download_button(
+        label="📥 下载 SQL 文件",
+        data=sql_content,
+        file_name=f"{file_prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.sql",
+        mime="text/sql",
+        use_container_width=True,
+        key=download_key,
+    )
+
 def extract_schema_description(annotation_lines):
     annotation_text = " ".join(annotation_lines)
     schema_match = re.search(r'@Schema\s*\((.*?)\)', annotation_text)
@@ -174,6 +187,9 @@ def expand_java_entity_fields(entities, root_class_name):
             if is_nested_entity:
                 expanded_fields.append(
                     {
+                        "source_entity": class_name,
+                        "source_field": field["field_name"],
+                        "source_field_type": field_type,
                         "column_code": next_code,
                         "column_name_cn": next_name,
                         "column_type": current_column_type,
@@ -184,6 +200,9 @@ def expand_java_entity_fields(entities, root_class_name):
             else:
                 expanded_fields.append(
                     {
+                        "source_entity": class_name,
+                        "source_field": field["field_name"],
+                        "source_field_type": field_type,
                         "column_code": next_code,
                         "column_name_cn": next_name,
                         "column_type": "STRING",
@@ -252,8 +271,7 @@ with tab_sql:
 
                     inserts.append(build_insert_sql(column_code, cn_name, model_code, model_type, parent_code, now_str))
 
-                st.success(f"成功生成 {len(inserts)} 条数据！")
-                st.code("\n".join(inserts), language="sql")
+                render_sql_result(inserts, "download_sql_ddl", "sql_ddl_insert")
             except Exception as e:
                 st.error(f"解析失败，请检查输入格式。错误详情: {e}")
         else:
@@ -283,6 +301,19 @@ with tab_java:
                     )
                     for field in fields
                 ]
+                compare_rows = [
+                    {
+                        "来源实体类": field["source_entity"],
+                        "实体字段": field["source_field"],
+                        "字段类型": field["source_field_type"],
+                        "生成column_code": field["column_code"],
+                        "生成column_name_cn": field["column_name_cn"],
+                        "生成column_type": field["column_type"],
+                        "parent_column_code": field["parent_column_code"] or "",
+                        "对应SQL": inserts[index],
+                    }
+                    for index, field in enumerate(fields)
+                ]
 
                 st.subheader("识别结果")
                 st.write(f"识别到 {len(class_order)} 个实体类，默认以 `{class_order[0]}` 作为主实体。")
@@ -298,8 +329,9 @@ with tab_java:
                 )
 
                 if inserts:
-                    st.success(f"成功生成 {len(inserts)} 条数据！")
-                    st.code("\n".join(inserts), language="sql")
+                    st.subheader("字段与 SQL 对照")
+                    st.dataframe(compare_rows, use_container_width=True)
+                    render_sql_result(inserts, "download_java_entity", "java_entity_insert")
                 else:
                     st.warning("未识别到可生成的实体类字段，请检查字段定义、嵌套关系或 @Schema 注解格式。")
             except Exception as e:

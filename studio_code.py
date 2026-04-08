@@ -87,6 +87,7 @@ def analyze_java_type(field_type):
 def parse_java_entities(java_text):
     entities = {}
     class_order = []
+    entity_diagnostics = {}
     annotation_buffer = []
     pending_description = ""
     current_class = None
@@ -103,6 +104,7 @@ def parse_java_entities(java_text):
             if current_class not in entities:
                 entities[current_class] = []
                 class_order.append(current_class)
+                entity_diagnostics[current_class] = {"field_count": 0}
             brace_depth += line.count("{") - line.count("}")
             annotation_buffer = []
             pending_description = ""
@@ -132,6 +134,7 @@ def parse_java_entities(java_text):
                         "column_name_cn": pending_description or field_name,
                     }
                 )
+                entity_diagnostics[current_class]["field_count"] += 1
             annotation_buffer = []
             pending_description = ""
 
@@ -142,12 +145,7 @@ def parse_java_entities(java_text):
             annotation_buffer = []
             pending_description = ""
 
-    return entities, class_order
-
-def build_nested_column_name(prefix, field_name_cn):
-    if not prefix:
-        return field_name_cn
-    return f"{prefix}-{field_name_cn}"
+    return entities, class_order, entity_diagnostics
 
 def expand_java_entity_fields(entities, root_class_name):
     expanded_fields = []
@@ -157,7 +155,7 @@ def expand_java_entity_fields(entities, root_class_name):
         "Timestamp", "Object", "Map", "JSONObject"
     }
 
-    def walk(class_name, code_prefix="", name_prefix="", seen_classes=None, inherited_parent_code=""):
+    def walk(class_name, seen_classes=None, inherited_parent_code=""):
         if class_name not in entities:
             return
 
@@ -168,7 +166,7 @@ def expand_java_entity_fields(entities, root_class_name):
         next_seen_classes = seen_classes | {class_name}
         for field in entities[class_name]:
             next_code = field["field_name"]
-            next_name = build_nested_column_name(name_prefix, field["column_name_cn"])
+            next_name = field["column_name_cn"]
             field_type = field["field_type"]
             is_nested_entity = field_type in entities and field_type not in primitive_types
             current_column_type = "LIST" if field.get("is_list") else "OBJECT"
@@ -182,7 +180,7 @@ def expand_java_entity_fields(entities, root_class_name):
                         "parent_column_code": inherited_parent_code,
                     }
                 )
-                walk(field_type, next_code, next_name, next_seen_classes, next_code)
+                walk(field_type, next_seen_classes, next_code)
             else:
                 expanded_fields.append(
                     {
@@ -267,7 +265,7 @@ with tab_java:
     if st.button("🚀 通过 Java 实体类生成", type="primary", use_container_width=True):
         if java_input:
             try:
-                entities, class_order = parse_java_entities(java_input)
+                entities, class_order, entity_diagnostics = parse_java_entities(java_input)
                 if not class_order:
                     raise ValueError("未识别到实体类定义")
 
@@ -286,8 +284,20 @@ with tab_java:
                     for field in fields
                 ]
 
+                st.subheader("识别结果")
+                st.write(f"识别到 {len(class_order)} 个实体类，默认以 `{class_order[0]}` 作为主实体。")
+                st.table(
+                    [
+                        {
+                            "实体类": class_name,
+                            "识别字段数": entity_diagnostics[class_name]["field_count"],
+                            "格式": "正常" if entity_diagnostics[class_name]["field_count"] > 0 else "未识别到字段",
+                        }
+                        for class_name in class_order
+                    ]
+                )
+
                 if inserts:
-                    st.caption(f"已识别 {len(class_order)} 个实体类，默认以第一个实体类 `{class_order[0]}` 作为主实体递归展开。")
                     st.success(f"成功生成 {len(inserts)} 条数据！")
                     st.code("\n".join(inserts), language="sql")
                 else:
